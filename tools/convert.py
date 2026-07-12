@@ -145,6 +145,12 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
+class ModelIdeogram4(ModelTemplate):
+    arch = "ideogram4"
+    keys_detect = [
+        ("embed_image_indicator.weight", )
+    ]
+
 class ModelKrea2(ModelTemplate):
     arch = "krea2"
     keys_detect = [
@@ -152,7 +158,7 @@ class ModelKrea2(ModelTemplate):
     ]
 
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelKrea2]
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelIdeogram4, ModelKrea2]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
