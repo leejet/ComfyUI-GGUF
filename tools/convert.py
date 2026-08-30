@@ -157,8 +157,14 @@ class ModelKrea2(ModelTemplate):
         ("txtfusion.projector.weight", "text_fusion.projector.weight")
     ]
 
+class ModelMiniMax(ModelTemplate):
+    arch = "minimax"
+    keys_detect = [
+        ("video_patch_proj.weight", "audio_patch_proj.weight")
+    ]
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelIdeogram4, ModelKrea2]
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelIdeogram4, ModelKrea2, ModelMiniMax]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
