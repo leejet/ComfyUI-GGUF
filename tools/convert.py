@@ -163,8 +163,15 @@ class ModelMiniMax(ModelTemplate):
         ("video_patch_proj.weight", "audio_patch_proj.weight")
     ]
 
+class QwenImage21(ModelTemplate):
+    arch = "qwen_image21"
+    keys_detect = [
+        ("txt_in.text_norm.weight",)
+    ]
+
 arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
-             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, ModelIdeogram4, ModelKrea2, ModelMiniMax]
+             ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2, 
+             ModelIdeogram4, ModelKrea2, ModelMiniMax, QwenImage21]
 
 def is_model_arch(model, state_dict):
     # check if model is correct
