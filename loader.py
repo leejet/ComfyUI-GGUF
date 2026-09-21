@@ -138,8 +138,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             torch_tensor = torch_tensor.view(*shape)
         state_dict[sd_key] = GGMLTensor(torch_tensor, tensor_type=tensor.tensor_type, tensor_shape=shape)
 
-        # 1D tensors shouldn't be quantized, this is a fix for BF16
-        if len(shape) <= 1 and tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
+        # 1D tensors shouldn't be quantized, this is a fix for BF16 and for
+        # sd.cpp builds that quantize 1D norm weights
+        if len(shape) <= 1 and is_quantized(state_dict[sd_key]):
             state_dict[sd_key] = dequantize_tensor(state_dict[sd_key], dtype=torch.float32)
 
         # keep track of loaded tensor types
