@@ -221,6 +221,22 @@ CLIP_VISION_SD_MAP = {
     "ln2.": "norm2.",
 }
 
+QWEN3_VISION_SD_MAP = {
+    "mm.0.": "visual.merger.linear_fc1.",
+    "mm.2.": "visual.merger.linear_fc2.",
+    "v.post_ln.": "visual.merger.norm.",
+    "v.position_embd.": "visual.pos_embed.",
+    "v.patch_embd": "visual.patch_embed.proj",
+    "v.blk.": "visual.blocks.",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+    "attn_qkv.": "attn.qkv.",
+    "attn_out.": "attn.proj.",
+    "ln1.": "norm1.",
+    "ln2.": "norm2.",
+}
+
+
 def sd_map_replace(raw_sd, key_map):
     sd = {}
     for k,v in raw_sd.items():
@@ -299,7 +315,7 @@ def gguf_mmproj_loader(path):
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
     target = os.path.join(root, target[0])
-    vsd, _ = gguf_sd_loader(target, is_text_model=True)
+    vsd, extra = gguf_sd_loader(target, is_text_model=True)
 
     # concat 4D to 5D
     if "v.patch_embd.weight.1" in vsd:
@@ -308,7 +324,14 @@ def gguf_mmproj_loader(path):
         vsd["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
 
     # run main replacement
-    vsd = sd_map_replace(vsd, CLIP_VISION_SD_MAP)
+    key_map = CLIP_VISION_SD_MAP
+    if extra["metadata"].get("clip.projector_type") == "qwen3vl_merger":
+        key_map = QWEN3_VISION_SD_MAP.copy()
+        deepstack_layers = sorted({int(k.split(".")[2]) for k in vsd if k.startswith("v.deepstack.")})
+        for i, layer in enumerate(deepstack_layers):
+            for src, dst in (("fc1", "linear_fc1"), ("fc2", "linear_fc2"), ("norm", "norm")):
+                key_map[f"v.deepstack.{layer}.{src}."] = f"visual.deepstack_merger_list.{i}.{dst}."
+    vsd = sd_map_replace(vsd, key_map)
 
     # handle split Q/K/V
     if "visual.blocks.0.attn_q.weight" in vsd:
@@ -500,8 +523,12 @@ def gguf_clip_loader(path):
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch == "qwen2vl":
+        if arch in {"qwen2vl", "qwen3vl"}:
             vsd = gguf_mmproj_loader(path)
+            if arch == "qwen3vl":
+                if not vsd:
+                    raise ValueError(f"Qwen3-VL requires a matching mmproj GGUF alongside the text encoder: {path}")
+                vsd = {f"model.{k}": v for k, v in vsd.items()}
             sd.update(vsd)
     else:
         pass
