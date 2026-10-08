@@ -11,7 +11,7 @@ from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2",
                  "qwen_image", "ideogram4", "krea2", "minimax", "qwen_image21"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -58,8 +58,9 @@ def get_gguf_metadata(reader):
             if len(field.types) == 1:  # Simple scalar fields only
                 if field.types[0] == gguf.GGUFValueType.STRING:
                     metadata[field_name] = str(field.parts[field.data[-1]], "utf-8")
-                elif field.types[0] == gguf.GGUFValueType.INT32:
-                    metadata[field_name] = int(field.parts[field.data[-1]])
+                elif field.types[0] in (gguf.GGUFValueType.INT32, gguf.GGUFValueType.UINT32):
+                    # UINT32 parts arrive as 1-element arrays, so unwrap before casting.
+                    metadata[field_name] = int(field.parts[field.data[-1]].reshape(-1)[0])
                 elif field.types[0] == gguf.GGUFValueType.F32:
                     metadata[field_name] = float(field.parts[field.data[-1]])
                 elif field.types[0] == gguf.GGUFValueType.BOOL:
@@ -207,6 +208,29 @@ GEMMA3_SD_MAP.update({
     "post_ffw_norm": "post_feedforward_layernorm",
     "post_attention_norm": "post_attention_layernorm",
 })
+
+# Qwen3.5 linear-attention (GatedDeltaNet) tensors. llama.cpp names them ssm_* and fuses
+# q/k/v into attn_qkv; ComfyUI wants linear_attn.* / self_attn.*. Matching is done per key
+# against this map rather than by substring replace, which would rewrite attn_q inside
+# attn_qkv and ssm_a inside ssm_alpha.
+
+QWEN35_ATTN_MAP = {
+    "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z",
+    "ssm_alpha": "linear_attn.in_proj_a",
+    "ssm_beta": "linear_attn.in_proj_b",
+    "ssm_out": "linear_attn.out_proj",
+    "ssm_conv1d": "linear_attn.conv1d",
+    "ssm_dt": "linear_attn.dt_bias",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_norm": "linear_attn.norm",
+    "attn_q_norm": "self_attn.q_norm",
+    "attn_k_norm": "self_attn.k_norm",
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_output": "self_attn.o_proj",
+}
 
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
@@ -530,6 +554,138 @@ def gguf_clip_loader(path):
                     raise ValueError(f"Qwen3-VL requires a matching mmproj GGUF alongside the text encoder: {path}")
                 vsd = {f"model.{k}": v for k, v in vsd.items()}
             sd.update(vsd)
+    elif arch == "qwen35":
+        # Dequantize the two vocab-sized tensors up front. Left as GGMLTensor they are
+        # re-dequantized on every forward, which both churns GBs per token and starves VRAM.
+        for key in ("token_embd.weight", "output.weight"):
+            if key in sd and sd[key].shape[0] >= (64 * 1024):
+                logging.warning(f"Dequantizing {key} to prevent runtime OOM.")
+                sd[key] = dequantize_tensor(sd[key], dtype=torch.float16)
+        meta = extra.get("metadata", {})
+        sd = qwen35_sd_remap(
+            sd,
+            num_k_heads=int(meta.get("qwen35.ssm.group_count", 16)),
+            num_v_heads=int(meta.get("qwen35.ssm.time_step_rank", 32)),
+            # convert_hf_to_gguf writes state_size from linear_key_head_dim.
+            head_k_dim=int(meta.get("qwen35.ssm.state_size", 128)),
+            head_v_dim=int(meta.get("qwen35.ssm.state_size", 128)),
+        )
+        vsd = gguf_mmproj_loader(path)
+        if vsd:
+            # sd.py strips the "model.visual." prefix before loading the vision tower.
+            sd.update({f"model.{k}": v for k, v in vsd.items()})
     else:
         pass
     return sd
+
+def qwen35_unreorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim):
+    """Undo llama.cpp's _reorder_v_heads (convert_hf_to_gguf.py, conversion/qwen.py).
+
+    convert_hf_to_gguf regroups the linear-attention value heads from HF's per-key-head
+    order into llama.cpp's tiled order whenever linear_num_key_heads != linear_num_value_heads.
+    The operation swaps two axes, so applying it again restores the HF layout ComfyUI expects.
+    """
+    shape = list(tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1:]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).contiguous().reshape(*shape)
+
+
+def qwen35_sd_remap(sd, num_k_heads=16, num_v_heads=32, head_k_dim=128, head_v_dim=128):
+    """llama.cpp qwen35 tensor names -> ComfyUI qwen35_* module names.
+
+    Done per-key with explicit suffix matching: a flat substring replace would
+    corrupt attn_q -> attn_qkv and ssm_a -> ssm_alpha.
+    """
+    out = {}
+    for key, val in sd.items():
+        if key == "token_embd.weight":
+            new_key = "model.language_model.embed_tokens.weight"
+        elif key == "output_norm.weight":
+            new_key = "model.language_model.norm.weight"
+        elif key == "output.weight":
+            new_key = "lm_head.weight"
+        elif not key.startswith("blk."):
+            raise ValueError(f"Unexpected tensor name in qwen35 GGUF: {key}")
+        else:
+            layer, rest = key[4:].split(".", 1)
+            prefix = f"model.language_model.layers.{layer}."
+            if rest.startswith("attn_norm."):
+                new_key = prefix + "input_layernorm." + rest[len("attn_norm."):]
+            elif rest.startswith("post_attention_norm."):
+                new_key = prefix + "post_attention_layernorm." + rest[len("post_attention_norm."):]
+            elif rest.startswith("ffn_up."):
+                new_key = prefix + "mlp.up_proj." + rest[len("ffn_up."):]
+            elif rest.startswith("ffn_down."):
+                new_key = prefix + "mlp.down_proj." + rest[len("ffn_down."):]
+            elif rest.startswith("ffn_gate."):
+                new_key = prefix + "mlp.gate_proj." + rest[len("ffn_gate."):]
+            elif rest == "ssm_dt.bias":
+                # llama.cpp names the dt bias as a bias; ComfyUI keeps it bare.
+                new_key = prefix + "linear_attn.dt_bias"
+            else:
+                matched = False
+                for src, dst in QWEN35_ATTN_MAP.items():
+                    if rest == src or rest.startswith(src + "."):
+                        new_key = prefix + dst + rest[len(src):]
+                        matched = True
+                        break
+                if not matched:
+                    raise ValueError(f"Unexpected qwen35 layer tensor: {key}")
+        out[new_key] = val
+
+    # Undo llama.cpp's value-head regrouping for the GatedDeltaNet (linear attention) tensors.
+    if num_k_heads and num_v_heads and num_k_heads != num_v_heads:
+        num_v_per_k = num_v_heads // num_k_heads
+        qk_dim = head_k_dim * num_k_heads
+
+        def reorder(key, dim, head_dim, row_offset=0):
+            tensor = out[key]
+            if is_quantized(tensor):
+                tensor = dequantize_tensor(tensor, dtype=torch.float16)
+            else:
+                tensor = tensor.to(dtype=torch.float16)
+            if row_offset:
+                head = tensor[:row_offset]
+                tail = qwen35_unreorder_v_heads(tensor[row_offset:], dim, num_k_heads, num_v_per_k, head_dim)
+                tensor = torch.cat([head, tail], dim=0) if dim == 0 else torch.cat([head, tail], dim=1)
+            else:
+                tensor = qwen35_unreorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)
+            out[key] = tensor
+
+        for key in [k for k in out if k.endswith("linear_attn.in_proj_qkv.weight")]:
+            reorder(key, 0, head_v_dim, row_offset=2 * qk_dim)
+        for key in [k for k in out if k.endswith("linear_attn.in_proj_z.weight")]:
+            reorder(key, 0, head_v_dim)
+        for suffix in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "linear_attn.A_log", "linear_attn.dt_bias"):
+            for key in [k for k in out if k.endswith(suffix)]:
+                reorder(key, 0, 1)
+        for key in [k for k in out if k.endswith("linear_attn.out_proj.weight")]:
+            reorder(key, 1, head_v_dim)
+
+        # GatedDeltaNet conv1d: llama.cpp stores (channels, kernel), torch Conv1d wants
+        # (out_channels, in_channels/groups, kernel). Only the value channels are regrouped.
+        for key in [k for k in out if k.endswith("linear_attn.conv1d.weight")]:
+            conv = out[key]
+            if is_quantized(conv):
+                conv = dequantize_tensor(conv, dtype=torch.float32)
+            shape = getattr(conv, "tensor_shape", conv.shape)
+            if len(shape) != 2:
+                continue
+            head, tail = conv[:2 * qk_dim], conv[2 * qk_dim:]
+            tail = qwen35_unreorder_v_heads(tail, 0, num_k_heads, num_v_per_k, head_v_dim)
+            out[key] = torch.cat([head, tail], dim=0).reshape(shape[0], 1, shape[1])
+
+    # convert_hf_to_gguf writes A_log as -exp(A_log); ComfyUI applies the exp() itself.
+    for key in [k for k in out if k.endswith("linear_attn.A_log")]:
+        out[key] = torch.log(-out[key].to(dtype=torch.float32))
+
+    # convert_hf_to_gguf folds the (1 + w) RMSNorm scaling into every norm weight except
+    # linear_attn.norm; ComfyUI applies the 1.0 itself (rms_norm_add=True).
+    for key in [k for k in out if k.endswith("weight") and "norm" in k and not k.endswith("linear_attn.norm.weight")]:
+        out[key] = out[key].to(dtype=torch.float32) - 1.0
+    return out
