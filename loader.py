@@ -11,7 +11,7 @@ from .dequant import is_quantized, dequantize_tensor
 
 IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2",
                  "qwen_image", "ideogram4", "krea2", "minimax", "qwen_image21"}
-TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
+TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
 def get_orig_shape(reader, tensor_name):
@@ -208,6 +208,23 @@ GEMMA3_SD_MAP.update({
     "post_attention_norm": "post_attention_layernorm",
 })
 
+QWEN35_SD_MAP = {
+    "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z",
+    "ssm_alpha": "linear_attn.in_proj_a",
+    "ssm_beta": "linear_attn.in_proj_b",
+    "ssm_conv1d": "linear_attn.conv1d",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_norm": "linear_attn.norm",
+    "ssm_out": "linear_attn.out_proj",
+    "ssm_a": "linear_attn.A_log",
+    "post_attention_norm": "post_attention_layernorm",
+    **LLAMA_SD_MAP,
+    "blk.": "model.language_model.layers.",
+    "token_embd": "model.language_model.embed_tokens",
+    "output_norm": "model.language_model.norm",
+}
+
 CLIP_VISION_SD_MAP = {
     "mm.": "visual.merger.mlp.",
     "v.post_ln.": "visual.merger.ln_q.",
@@ -279,6 +296,52 @@ def gemma3_norm_corrections(sd):
     #logging.info(f"Gemma3: Applied -1 norm correction to {corrected} tensors")
     return sd
 
+def qwen35_permute(tensor, n_head, n_head_kv, dim=0, qk_rows=0):
+    quantized = is_quantized(tensor)
+    shape = tensor.shape
+    # Row permutations preserve packed blocks; column permutations can split them.
+    if quantized and dim == 1:
+        tensor = dequantize_tensor(tensor, dtype=torch.float16)
+        quantized = False
+    data = torch.Tensor(tensor)
+    qk = data[:qk_rows]
+    if qk_rows:
+        data = data[qk_rows:]
+    data = data.unflatten(dim, (n_head // n_head_kv, n_head_kv, -1)).transpose(dim, dim + 1).reshape(data.shape)
+    if qk_rows:
+        data = torch.cat((qk, data), dim=0)
+    if quantized:
+        return GGMLTensor(data, tensor_type=tensor.tensor_type, tensor_shape=shape)
+    return data
+
+def qwen35_corrections(sd):
+    prefix = "model.language_model.layers.0.linear_attn."
+    n_head = sd[prefix + "A_log"].shape[0]
+    value_dim = sd[prefix + "in_proj_z.weight"].shape[0]
+    qk_rows = sd[prefix + "in_proj_qkv.weight"].shape[0] - value_dim
+    n_head_kv = qk_rows // 2 // (value_dim // n_head)
+    norm_suffixes = ("input_layernorm.weight", "post_attention_layernorm.weight",
+                     "self_attn.q_norm.weight", "self_attn.k_norm.weight", "model.language_model.norm.weight")
+    for key, value in sd.items():
+        # Undo llama.cpp's norm offset and -exp(A_log) conversion.
+        if key.endswith(norm_suffixes):
+            value = torch.Tensor(dequantize_tensor(value, dtype=torch.float32)) - 1.0
+        elif key.endswith(".linear_attn.A_log"):
+            value = (-torch.Tensor(dequantize_tensor(value, dtype=torch.float32))).log()
+
+        if n_head != n_head_kv:
+            if key.endswith((".linear_attn.in_proj_qkv.weight", ".linear_attn.conv1d.weight")):
+                value = qwen35_permute(value, n_head, n_head_kv, qk_rows=qk_rows)
+            elif key.endswith((".linear_attn.in_proj_z.weight", ".linear_attn.in_proj_a.weight",
+                               ".linear_attn.in_proj_b.weight", ".linear_attn.A_log", ".linear_attn.dt_bias")):
+                value = qwen35_permute(value, n_head, n_head_kv)
+            elif key.endswith(".linear_attn.out_proj.weight"):
+                value = qwen35_permute(value, n_head, n_head_kv, dim=1)
+        if key.endswith(".linear_attn.conv1d.weight"):
+            value = torch.Tensor(dequantize_tensor(value, dtype=torch.float32)).unsqueeze(1)
+        sd[key] = value
+    return sd
+
 def strip_quant_suffix(name):
     pattern = r"[-_]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
     match = re.search(pattern, name, re.IGNORECASE)
@@ -308,7 +371,7 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
+        logging.warning(f"Can't find matching mmproj for '{tenc_fname}'. Image inputs require a matching mmproj GGUF.")
         return {}
     if len(target) > 1:
         logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
@@ -504,7 +567,7 @@ def gguf_clip_loader(path):
             logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
             sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
-    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
+    elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
         temb_key = "token_embd.weight"
         if temb_key in sd and sd[temb_key].shape[0] >= (64 * 1024):
@@ -519,11 +582,14 @@ def gguf_clip_loader(path):
         if arch == "gemma3":
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)
+        elif arch == "qwen35":
+            sd = sd_map_replace(sd, QWEN35_SD_MAP)
+            sd = qwen35_corrections(sd)
         else:
             sd = sd_map_replace(sd, LLAMA_SD_MAP)
         if arch == "llama":
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
-        if arch in {"qwen2vl", "qwen3vl"}:
+        if arch in {"qwen2vl", "qwen3vl", "qwen35"}:
             vsd = gguf_mmproj_loader(path)
             if arch == "qwen3vl":
                 if not vsd:
