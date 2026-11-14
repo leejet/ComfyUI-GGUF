@@ -233,6 +233,12 @@ class CLIPLoaderGGUF:
         return clip_data
 
     def load_patcher(self, clip_paths, clip_type, clip_data):
+        for i, sd in enumerate(clip_data):
+            if (clip_type.name == "MINIMAX"
+                    and "model.layers.49.self_attn.q_proj.weight" in sd
+                    and "model.visual.deepstack_merger_list.0.norm.weight" in sd):
+                # Core identifies MiniMax's 50-layer Qwen3-VL-32B by bare visual.* keys.
+                clip_data[i] = comfy.utils.state_dict_prefix_replace(sd, {"model.visual.": "visual."})
         clip = comfy.sd.load_text_encoder_state_dicts(
             clip_type = clip_type,
             state_dicts = clip_data,
